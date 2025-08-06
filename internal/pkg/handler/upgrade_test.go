@@ -18,6 +18,7 @@ import (
 	"github.com/stakater/Reloader/internal/pkg/util"
 	"github.com/stakater/Reloader/pkg/kube"
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -672,7 +673,7 @@ func teardownArs() {
 		logrus.Errorf("Error while deleting statefulSet with secret as env var source %v", statefulSetError)
 	}
 
-	// Deleting Deployment with pasuse annotation
+	// Deleting Deployment with pause annotation
 	deploymentError = testutil.DeleteDeployment(clients.KubernetesClient, arsNamespace, arsConfigmapWithPausedDeployment)
 	if deploymentError != nil {
 		logrus.Errorf("Error while deleting deployment with configmap %v", deploymentError)
@@ -708,7 +709,7 @@ func teardownArs() {
 		logrus.Errorf("Error while deleting the configmap %v", err)
 	}
 
-	// Deleting Configmap used projected volume in init containers
+	// Deleting secret used in projected volume in init containers
 	err = testutil.DeleteSecret(clients.KubernetesClient, arsNamespace, arsProjectedSecretWithInitContainer)
 	if err != nil {
 		logrus.Errorf("Error while deleting the secret %v", err)
@@ -1392,7 +1393,7 @@ func teardownErs() {
 		logrus.Errorf("Error while deleting the configmap %v", err)
 	}
 
-	// Deleting Configmap used projected volume in init containers
+	// Deleting secret used in projected volume in init containers
 	err = testutil.DeleteSecret(clients.KubernetesClient, ersNamespace, ersProjectedSecretWithInitContainer)
 	if err != nil {
 		logrus.Errorf("Error while deleting the secret %v", err)
@@ -1475,7 +1476,7 @@ func teardownErs() {
 		logrus.Errorf("Error while deleting the configmap used with configmap exclude annotation: %v", err)
 	}
 
-	// Deleting ConfigMap for testins pausing deployments
+	// Deleting ConfigMap for testing pausing deployments
 	err = testutil.DeleteConfigMap(clients.KubernetesClient, ersNamespace, ersConfigmapWithPausedDeployment)
 	if err != nil {
 		logrus.Errorf("Error while deleting the configmap: %v", err)
@@ -2247,7 +2248,7 @@ func TestRollingUpgradeForDeploymentWithSecretExcludeAnnotationUsingArs(t *testi
 	logrus.Infof("Verifying deployment did not update")
 	updated := testutil.VerifyResourceAnnotationUpdate(clients, config, deploymentFuncs)
 	if updated {
-		t.Errorf("Deployment which had to be exluded was updated")
+		t.Errorf("Deployment which had to be excluded was updated")
 	}
 }
 
@@ -4213,4 +4214,269 @@ func waitForDeploymentPausedAtAnnotation(clients kube.Clients, deploymentFuncs c
 	}
 
 	return fmt.Errorf("timeout waiting for deployment %s to have pause-period annotation", deploymentName)
+}
+
+// MockDeploymentWithEmptyContainers creates a mock deployment with no containers
+// This simulates the scenario where Argo Rollouts with workloadRef return empty containers
+func MockDeploymentWithEmptyContainers(namespace, name string) *runtime.Object {
+	deployment := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: v1.PodSpec{
+			Containers:     []v1.Container{}, // Empty containers slice
+			InitContainers: []v1.Container{}, // Empty init containers slice
+		},
+	}
+	var obj runtime.Object = deployment
+	return &obj
+}
+
+// MockUpgradeFuncsWithEmptyContainers creates upgrade functions that return empty containers
+// This simulates the behavior of GetRolloutContainers for workloadRef rollouts
+func MockUpgradeFuncsWithEmptyContainers() callbacks.RollingUpgradeFuncs {
+	return callbacks.RollingUpgradeFuncs{
+		ContainersFunc: func(item runtime.Object) []v1.Container {
+			return []v1.Container{} // Always return empty slice
+		},
+		InitContainersFunc: func(item runtime.Object) []v1.Container {
+			return []v1.Container{} // Always return empty slice
+		},
+		VolumesFunc: func(item runtime.Object) []v1.Volume {
+			return []v1.Volume{} // No volumes
+		},
+		ResourceType: "MockResource",
+	}
+}
+
+// TestGetContainerUsingResourceWithEmptyContainers tests that the function
+// handles empty containers gracefully without panicking
+func TestGetContainerUsingResourceWithEmptyContainers(t *testing.T) {
+	// Setup test data
+	namespace := "test-namespace"
+	resourceName := "test-resource"
+
+	// Create a mock deployment with empty containers
+	mockDeployment := MockDeploymentWithEmptyContainers(namespace, "test-deployment")
+
+	// Create upgrade functions that return empty containers (simulating workloadRef rollouts)
+	upgradeFuncs := MockUpgradeFuncsWithEmptyContainers()
+
+	// Create config for configmap test
+	config := util.Config{
+		Namespace:    namespace,
+		ResourceName: resourceName,
+		Type:         constants.ConfigmapEnvVarPostfix,
+		SHAValue:     "test-sha",
+	}
+
+	// Test cases
+	testCases := []struct {
+		name       string
+		autoReload bool
+		expected   *v1.Container
+	}{
+		{
+			name:       "Non-auto reload with empty containers should return nil",
+			autoReload: false,
+			expected:   nil,
+		},
+		{
+			name:       "Auto reload with empty containers should return nil",
+			autoReload: true,
+			expected:   nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// This should not panic - our fix prevents the index out of range error
+			result := getContainerUsingResource(upgradeFuncs, *mockDeployment, config, tc.autoReload)
+
+			if result != tc.expected {
+				t.Errorf("Expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+
+// TestGetContainerUsingResourceWithEmptyInitContainers tests scenarios where
+// init containers exist but are empty, and main containers are also empty
+func TestGetContainerUsingResourceWithEmptyInitContainers(t *testing.T) {
+	namespace := "test-namespace"
+	resourceName := "test-resource"
+
+	// Create upgrade functions with empty init containers as well
+	upgradeFuncs := callbacks.RollingUpgradeFuncs{
+		ContainersFunc: func(item runtime.Object) []v1.Container {
+			return []v1.Container{} // Empty main containers
+		},
+		InitContainersFunc: func(item runtime.Object) []v1.Container {
+			// Return init containers that use the resource, but main containers are empty
+			return []v1.Container{
+				{
+					Name: "init-container",
+					Env: []v1.EnvVar{
+						{
+							Name: "CONFIGMAP_" + util.ConvertToEnvVarName(resourceName),
+							ValueFrom: &v1.EnvVarSource{
+								ConfigMapKeyRef: &v1.ConfigMapKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: resourceName,
+									},
+									Key: "test.key",
+								},
+							},
+						},
+					},
+				},
+			}
+		},
+		VolumesFunc: func(item runtime.Object) []v1.Volume {
+			return []v1.Volume{}
+		},
+		ResourceType: "MockResource",
+	}
+
+	mockDeployment := MockDeploymentWithEmptyContainers(namespace, "test-deployment")
+
+	config := util.Config{
+		Namespace:    namespace,
+		ResourceName: resourceName,
+		Type:         constants.ConfigmapEnvVarPostfix,
+		SHAValue:     "test-sha",
+	}
+
+	// This should return nil instead of panicking when trying to access containers[0]
+	result := getContainerUsingResource(upgradeFuncs, *mockDeployment, config, false)
+
+	if result != nil {
+		t.Errorf("Expected nil when main containers are empty, got %v", result)
+	}
+}
+
+// TestGetContainerUsingResourceWithVolumeMount tests the volume mount path with empty containers
+func TestGetContainerUsingResourceWithVolumeMount(t *testing.T) {
+	namespace := "test-namespace"
+	resourceName := "test-resource"
+	volumeName := "test-volume"
+
+	// Create upgrade functions that return a volume but no containers
+	upgradeFuncs := callbacks.RollingUpgradeFuncs{
+		ContainersFunc: func(item runtime.Object) []v1.Container {
+			return []v1.Container{} // Empty containers
+		},
+		InitContainersFunc: func(item runtime.Object) []v1.Container {
+			// Init container with volume mount
+			return []v1.Container{
+				{
+					Name: "init-container",
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      volumeName,
+							MountPath: "/test",
+						},
+					},
+				},
+			}
+		},
+		VolumesFunc: func(item runtime.Object) []v1.Volume {
+			return []v1.Volume{
+				{
+					Name: volumeName,
+					VolumeSource: v1.VolumeSource{
+						ConfigMap: &v1.ConfigMapVolumeSource{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: resourceName,
+							},
+						},
+					},
+				},
+			}
+		},
+		ResourceType: "MockResource",
+	}
+
+	mockDeployment := MockDeploymentWithEmptyContainers(namespace, "test-deployment")
+
+	config := util.Config{
+		Namespace:    namespace,
+		ResourceName: resourceName,
+		Type:         constants.ConfigmapEnvVarPostfix,
+		SHAValue:     "test-sha",
+	}
+
+	// This should return nil instead of panicking when containers are empty
+	result := getContainerUsingResource(upgradeFuncs, *mockDeployment, config, false)
+
+	if result != nil {
+		t.Errorf("Expected nil when main containers are empty even with volume mount, got %v", result)
+	}
+}
+
+// TestGetContainerUsingResourceWithEmptyContainersSecret tests the fix with Secret resources
+func TestGetContainerUsingResourceWithEmptyContainersSecret(t *testing.T) {
+	namespace := "test-namespace"
+	resourceName := "test-secret"
+
+	mockDeployment := MockDeploymentWithEmptyContainers(namespace, "test-deployment")
+	upgradeFuncs := MockUpgradeFuncsWithEmptyContainers()
+
+	// Test with Secret instead of ConfigMap
+	config := util.Config{
+		Namespace:    namespace,
+		ResourceName: resourceName,
+		Type:         constants.SecretEnvVarPostfix,
+		SHAValue:     "test-sha",
+	}
+
+	// Both autoReload scenarios should return nil without panicking
+	result1 := getContainerUsingResource(upgradeFuncs, *mockDeployment, config, false)
+	result2 := getContainerUsingResource(upgradeFuncs, *mockDeployment, config, true)
+
+	if result1 != nil || result2 != nil {
+		t.Errorf("Expected nil for both autoReload scenarios with empty containers and Secret resource")
+	}
+}
+
+// TestGetContainerUsingResourceWithArgoRolloutEmptyContainers tests with real Argo Rollout functions
+func TestGetContainerUsingResourceWithArgoRolloutEmptyContainers(t *testing.T) {
+	namespace := "test-namespace"
+	resourceName := "test-configmap"
+
+	// Use real Argo Rollout functions but mock the containers function
+	rolloutFuncs := GetArgoRolloutRollingUpgradeFuncs()
+	originalContainersFunc := rolloutFuncs.ContainersFunc
+	originalInitContainersFunc := rolloutFuncs.InitContainersFunc
+
+	// Override to return empty containers (simulating workloadRef scenario)
+	rolloutFuncs.ContainersFunc = func(item runtime.Object) []v1.Container {
+		return []v1.Container{} // Empty like workloadRef rollouts
+	}
+	rolloutFuncs.InitContainersFunc = func(item runtime.Object) []v1.Container {
+		return []v1.Container{} // Empty like workloadRef rollouts
+	}
+
+	// Restore original functions after test
+	defer func() {
+		rolloutFuncs.ContainersFunc = originalContainersFunc
+		rolloutFuncs.InitContainersFunc = originalInitContainersFunc
+	}()
+
+	mockRollout := MockDeploymentWithEmptyContainers(namespace, "test-rollout")
+
+	config := util.Config{
+		Namespace:    namespace,
+		ResourceName: resourceName,
+		Type:         constants.ConfigmapEnvVarPostfix,
+		SHAValue:     "test-sha",
+	}
+
+	// This tests the actual fix in the context of Argo Rollouts
+	result := getContainerUsingResource(rolloutFuncs, *mockRollout, config, false)
+
+	if result != nil {
+		t.Errorf("Expected nil when using real Argo Rollout functions with empty containers (workloadRef scenario), got %v", result)
+	}
 }
